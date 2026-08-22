@@ -5,22 +5,29 @@ import {
   evaluateCandidateConnections,
   filterStrictZeroCostCandidates,
   filterTosAvoidCandidates,
-  type FreeAccessState,
   type StrictZeroCostCandidate,
 } from "../../../open-sse/services/autoCombo/strictZeroCostFilter.ts";
+import type { ZeroSpendEvidence } from "../../../open-sse/services/autoCombo/zeroSpendEvidence.ts";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "../../../open-sse/services/autoCombo/resilienceCandidateFilter.ts";
 import type { FreeModelBudget } from "../../../open-sse/config/freeModelCatalog.ts";
 
 const NOW = "2026-08-22T12:00:00.000Z";
-const OPTIONS = { minRemainingAllowance: 1, maxStateAgeMs: 180_000, now: () => Date.parse(NOW) };
+const OPTIONS = { minRemainingAllowance: 1, maxEvidenceAgeMs: 180_000, now: () => Date.parse(NOW) };
 const REAL_CONN = "conn-real-1";
 
-function safeState(overrides: Partial<FreeAccessState> = {}): FreeAccessState {
+function safeEvidence(overrides: Partial<ZeroSpendEvidence> = {}): ZeroSpendEvidence {
   return {
     status: "SAFE",
+    kind: "free-quota",
     remainingFreeAllowance: 40,
-    resetAt: null,
+    effectiveInputPrice: null,
+    effectiveOutputPrice: null,
+    paidSpendPossible: false,
+    hardStopVerified: true,
     checkedAt: NOW,
+    expiresAt: null,
+    source: "fixture",
+    promotional: false,
     ...overrides,
   };
 }
@@ -38,7 +45,7 @@ function keylessEntry(modelId = "keyless-model", tos: FreeModelBudget["tos"] = "
   };
 }
 
-function quotaEntry(modelId = "quota-model", hardStopGuaranteed = true): FreeModelBudget {
+function quotaEntry(modelId = "quota-model"): FreeModelBudget {
   return {
     provider: "fixture-quota",
     modelId,
@@ -48,7 +55,7 @@ function quotaEntry(modelId = "quota-model", hardStopGuaranteed = true): FreeMod
     freeType: "recurring-daily",
     poolKey: null,
     tos: "ok",
-    hardStopGuaranteed,
+    hardStopGuaranteed: true,
   };
 }
 
@@ -58,20 +65,20 @@ test("strict policy disabled returns the original pool reference", () => {
   ];
   const out = filterStrictZeroCostCandidates(pool, {
     enabled: false,
-    resolveFreeAccessState: () => undefined,
+    resolveZeroSpendEvidence: () => undefined,
     ...OPTIONS,
   });
   assert.equal(out, pool);
 });
 
-test("genuine no-auth keyless candidate passes without a live quota lookup", () => {
+test("genuine no-auth keyless candidate passes without live economic evidence", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "fixture-keyless",
     model: "keyless-model",
     connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID,
   };
   const resolve = () => {
-    throw new Error("keyless no-auth must not query quota state");
+    throw new Error("genuine keyless no-auth must not resolve account evidence");
   };
   assert.deepEqual(
     evaluateCandidateConnections(candidate, keylessEntry(), resolve, OPTIONS),
@@ -79,30 +86,21 @@ test("genuine no-auth keyless candidate passes without a live quota lookup", () 
   );
 });
 
-test("quota candidate passes only with hard stop and fresh positive SAFE allowance", () => {
+test("credentialed candidate follows typed economic evidence", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "fixture-quota",
     model: "quota-model",
     connectionId: REAL_CONN,
   };
   assert.deepEqual(
-    evaluateCandidateConnections(candidate, quotaEntry(), () => safeState(), OPTIONS),
+    evaluateCandidateConnections(candidate, quotaEntry(), () => safeEvidence(), OPTIONS),
     [REAL_CONN]
   );
   assert.deepEqual(
     evaluateCandidateConnections(
       candidate,
       quotaEntry(),
-      () => safeState({ status: "EXHAUSTED", remainingFreeAllowance: 0 }),
-      OPTIONS
-    ),
-    []
-  );
-  assert.deepEqual(
-    evaluateCandidateConnections(
-      candidate,
-      quotaEntry(false),
-      () => safeState(),
+      () => safeEvidence({ status: "EXHAUSTED", remainingFreeAllowance: 0 }),
       OPTIONS
     ),
     []
@@ -111,21 +109,39 @@ test("quota candidate passes only with hard stop and fresh positive SAFE allowan
     evaluateCandidateConnections(
       candidate,
       quotaEntry(),
-      () => safeState({ checkedAt: "2026-08-22T11:00:00.000Z" }),
+      () => safeEvidence({ checkedAt: "2026-08-22T11:00:00.000Z" }),
+      OPTIONS
+    ),
+    []
+  );
+  assert.deepEqual(
+    evaluateCandidateConnections(
+      candidate,
+      quotaEntry(),
+      () =>
+        safeEvidence({
+          kind: "effective-zero-price",
+          remainingFreeAllowance: null,
+          effectiveInputPrice: 0,
+          effectiveOutputPrice: 0,
+          paidSpendPossible: true,
+          hardStopVerified: false,
+          promotional: true,
+        }),
       OPTIONS
     ),
     []
   );
 });
 
-test("candidate missing from free evidence is excluded", () => {
+test("candidate missing from current free catalog evidence is excluded in the v1-compatible stage", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "unknown-provider",
     model: "unknown-model",
     connectionId: REAL_CONN,
   };
   assert.deepEqual(
-    evaluateCandidateConnections(candidate, undefined, () => safeState(), OPTIONS),
+    evaluateCandidateConnections(candidate, undefined, () => safeEvidence(), OPTIONS),
     []
   );
 });

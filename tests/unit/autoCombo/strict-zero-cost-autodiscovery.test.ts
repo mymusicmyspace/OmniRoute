@@ -4,17 +4,29 @@ import assert from "node:assert/strict";
 import {
   evaluateCandidateConnections,
   findBudgetEntry,
-  type FreeAccessState,
   type StrictZeroCostCandidate,
 } from "../../../open-sse/services/autoCombo/strictZeroCostFilter.ts";
+import type { ZeroSpendEvidence } from "../../../open-sse/services/autoCombo/zeroSpendEvidence.ts";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "../../../open-sse/services/autoCombo/resilienceCandidateFilter.ts";
 import type { FreeModelBudget } from "../../../open-sse/config/freeModelCatalog.ts";
 
 const NOW = "2026-08-22T12:00:00.000Z";
-const OPTIONS = { minRemainingAllowance: 1, maxStateAgeMs: 180_000, now: () => Date.parse(NOW) };
+const OPTIONS = { minRemainingAllowance: 1, maxEvidenceAgeMs: 180_000, now: () => Date.parse(NOW) };
 
-function safeState(): FreeAccessState {
-  return { status: "SAFE", remainingFreeAllowance: 40, resetAt: null, checkedAt: NOW };
+function safeEvidence(): ZeroSpendEvidence {
+  return {
+    status: "SAFE",
+    kind: "free-quota",
+    remainingFreeAllowance: 40,
+    effectiveInputPrice: null,
+    effectiveOutputPrice: null,
+    paidSpendPossible: false,
+    hardStopVerified: true,
+    checkedAt: NOW,
+    expiresAt: null,
+    source: "fixture",
+    promotional: false,
+  };
 }
 
 function keylessEntry(modelId: string): FreeModelBudget {
@@ -30,7 +42,7 @@ function keylessEntry(modelId: string): FreeModelBudget {
   };
 }
 
-function quotaEntry(modelId: string, hardStopGuaranteed = true): FreeModelBudget {
+function quotaEntry(modelId: string): FreeModelBudget {
   return {
     provider: "dynamic-quota",
     modelId,
@@ -40,23 +52,18 @@ function quotaEntry(modelId: string, hardStopGuaranteed = true): FreeModelBudget
     freeType: "recurring-daily",
     poolKey: null,
     tos: "ok",
-    hardStopGuaranteed,
+    hardStopGuaranteed: true,
   };
 }
 
-test("new catalog entry becomes eligible without a filter code change", () => {
+test("new keyless catalog entry becomes eligible without a filter code change", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "dynamic-keyless",
     model: "new-free-model",
     connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID,
   };
   assert.deepEqual(
-    evaluateCandidateConnections(
-      candidate,
-      findBudgetEntry(candidate, []),
-      () => undefined,
-      OPTIONS
-    ),
+    evaluateCandidateConnections(candidate, findBudgetEntry(candidate, []), () => undefined, OPTIONS),
     []
   );
   assert.deepEqual(
@@ -70,7 +77,7 @@ test("new catalog entry becomes eligible without a filter code change", () => {
   );
 });
 
-test("removed catalog entry becomes ineligible without a filter code change", () => {
+test("removed keyless catalog entry becomes ineligible without a filter code change", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "dynamic-keyless",
     model: "temporary-free-model",
@@ -91,7 +98,7 @@ test("removed catalog entry becomes ineligible without a filter code change", ()
   );
 });
 
-test("new quota model is admitted from metadata plus live SAFE state", () => {
+test("new credentialed quota model is admitted from catalog membership plus independent SAFE evidence", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "dynamic-quota",
     model: "new-quota-model",
@@ -102,26 +109,24 @@ test("new quota model is admitted from metadata plus live SAFE state", () => {
     evaluateCandidateConnections(
       candidate,
       findBudgetEntry(candidate, catalog),
-      () => safeState(),
+      () => safeEvidence(),
       OPTIONS
     ),
     ["connection-1"]
   );
 });
 
-test("incomplete safety metadata remains fail-closed", () => {
+test("catalog membership without economic evidence remains fail-closed", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "dynamic-quota",
-    model: "unguaranteed-model",
+    model: "unknown-economics-model",
     connectionId: "connection-1",
   };
-  const entry = quotaEntry("unguaranteed-model");
-  delete entry.hardStopGuaranteed;
   assert.deepEqual(
     evaluateCandidateConnections(
       candidate,
-      findBudgetEntry(candidate, [entry]),
-      () => safeState(),
+      findBudgetEntry(candidate, [quotaEntry("unknown-economics-model")]),
+      () => undefined,
       OPTIONS
     ),
     []

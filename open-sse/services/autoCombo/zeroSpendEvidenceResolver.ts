@@ -81,12 +81,16 @@ function isFiniteNonNegative(value: number): boolean {
   return Number.isFinite(value) && value >= 0;
 }
 
-function newerTimestamp(a: string, b: string): string {
+/**
+ * Composed evidence can be no fresher than its oldest independent proof. Invalid
+ * timestamps are intentionally propagated so the evaluator rejects them as stale.
+ */
+function olderTimestamp(a: string, b: string): string {
   const aMs = Date.parse(a);
   const bMs = Date.parse(b);
-  if (!Number.isFinite(aMs)) return b;
-  if (!Number.isFinite(bMs)) return a;
-  return aMs >= bMs ? a : b;
+  if (!Number.isFinite(aMs)) return a;
+  if (!Number.isFinite(bMs)) return b;
+  return aMs <= bMs ? a : b;
 }
 
 export function composeEffectiveZeroPriceEvidence(
@@ -104,7 +108,7 @@ export function composeEffectiveZeroPriceEvidence(
   return {
     status: "SAFE",
     kind: "effective-zero-price",
-    checkedAt: newerTimestamp(price.checkedAt, safety.checkedAt),
+    checkedAt: olderTimestamp(price.checkedAt, safety.checkedAt),
     expiresAt: price.expiresAt,
     remainingFreeAllowance: null,
     effectiveInputPrice: price.inputPerMillion,
@@ -279,9 +283,6 @@ const productionResolver = createZeroSpendEvidenceResolver({
   ttlMs: DEFAULT_TTL_MS,
 });
 
-// Built-ins are deliberately provider-specific. Adding a provider here requires an
-// independently reviewable price source and spend-safety contract; there is no
-// catch-all conversion from generic balances or free-looking model names.
 productionResolver.registerEffectiveModelPriceSource("openrouter", openRouterEffectivePriceSource);
 productionResolver.registerAccountSpendSafetySource("openrouter", openRouterSpendSafetySource);
 

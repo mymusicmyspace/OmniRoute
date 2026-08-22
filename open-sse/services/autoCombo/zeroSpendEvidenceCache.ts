@@ -21,6 +21,10 @@ function keyString(key: ZeroSpendEvidenceKey): string {
   return `${key.provider}\u0000${key.connectionId}\u0000${key.model}`;
 }
 
+function accountPrefix(provider: string, connectionId: string): string {
+  return `${provider}\u0000${connectionId}\u0000`;
+}
+
 function parseTimestamp(value: string | null): number | null {
   if (!value) return null;
   const parsed = Date.parse(value);
@@ -31,6 +35,8 @@ export class ZeroSpendEvidenceCache {
   private readonly cache = new Map<string, CacheEntry>();
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly queued = new Map<string, ZeroSpendEvidenceKey>();
+  private readonly generations = new Map<string, number>();
+  private readonly accountGenerations = new Map<string, number>();
   private readonly idleWaiters = new Set<() => void>();
   private readonly ttlMs: number;
   private readonly refreshFn: ZeroSpendEvidenceCacheOptions["refresh"];
@@ -66,13 +72,21 @@ export class ZeroSpendEvidenceCache {
 
   invalidate(provider: string, connectionId: string, model?: string): void {
     if (model !== undefined) {
-      this.cache.delete(keyString({ provider, connectionId, model }));
+      const serialized = keyString({ provider, connectionId, model });
+      this.cache.delete(serialized);
+      this.queued.delete(serialized);
+      this.generations.set(serialized, this.currentGeneration(serialized) + 1);
       return;
     }
 
-    const prefix = `${provider}\u0000${connectionId}\u0000`;
+    const prefix = accountPrefix(provider, connectionId);
+    this.accountGenerations.set(prefix, this.currentAccountGeneration(prefix) + 1);
+
     for (const serialized of this.cache.keys()) {
       if (serialized.startsWith(prefix)) this.cache.delete(serialized);
+    }
+    for (const serialized of this.queued.keys()) {
+      if (serialized.startsWith(prefix)) this.queued.delete(serialized);
     }
   }
 
@@ -113,12 +127,21 @@ export class ZeroSpendEvidenceCache {
 
   private startRefresh(key: ZeroSpendEvidenceKey): void {
     const serialized = keyString(key);
+    const prefix = accountPrefix(key.provider, key.connectionId);
+    const generationAtStart = this.currentGeneration(serialized);
+    const accountGenerationAtStart = this.currentAccountGeneration(prefix);
     this.activeRefreshes += 1;
 
     const task = (async () => {
       try {
         const evidence = await this.refreshFn(key);
-        if (evidence && this.isFresh(evidence)) {
+        const stillCurrent =
+          generationAtStart === this.currentGeneration(serialized) &&
+          accountGenerationAtStart === this.currentAccountGeneration(prefix);
+
+        if (!stillCurrent) {
+          this.cache.delete(serialized);
+        } else if (evidence && this.isFresh(evidence)) {
           this.cache.set(serialized, { evidence });
         } else {
           this.cache.delete(serialized);
@@ -134,6 +157,14 @@ export class ZeroSpendEvidenceCache {
     })();
 
     this.inFlight.set(serialized, task);
+  }
+
+  private currentGeneration(serialized: string): number {
+    return this.generations.get(serialized) ?? 0;
+  }
+
+  private currentAccountGeneration(prefix: string): number {
+    return this.accountGenerations.get(prefix) ?? 0;
   }
 
   private drainQueue(): void {

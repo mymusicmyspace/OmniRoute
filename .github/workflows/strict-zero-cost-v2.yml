@@ -1,0 +1,29 @@
+name: Strict Zero Cost v2 TDD
+
+on:
+  push:
+    branches:
+      - feat/strict-zero-cost-v2
+
+permissions:
+  contents: read
+
+jobs:
+  focused-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Run strict zero-cost focused tests
+        run: >-
+          npx vitest run
+          tests/unit/autoCombo/strict-zero-cost-filter.test.ts
+          tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts
+          tests/unit/autoCombo/strict-zero-cost-autodiscovery.test.ts

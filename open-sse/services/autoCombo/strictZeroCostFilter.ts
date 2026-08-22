@@ -69,18 +69,26 @@ export function evaluateCandidateConnections(
     "minRemainingAllowance" | "maxEvidenceAgeMs" | "now"
   >
 ): string[] {
-  if (!budgetEntry) return [];
-
   const isGenuineNoAuthCandidate =
     candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID;
 
-  if (KEYLESS_FREE_TYPES.has(budgetEntry.freeType) && isGenuineNoAuthCandidate) {
-    return [SYNTHETIC_NOAUTH_CONNECTION_ID];
+  // A synthetic no-auth route has no concrete account from which to obtain live
+  // economic evidence. It therefore needs curated keyless metadata. A free-looking
+  // model name alone is never enough.
+  if (isGenuineNoAuthCandidate) {
+    if (budgetEntry && KEYLESS_FREE_TYPES.has(budgetEntry.freeType)) {
+      return [SYNTHETIC_NOAUTH_CONNECTION_ID];
+    }
+    return [];
   }
 
-  if (budgetEntry.freeType === "discontinued") return [];
-  if (isGenuineNoAuthCandidate) return [];
+  if (budgetEntry?.freeType === "discontinued") return [];
 
+  // Credentialed routes are intentionally NOT gated on static catalog membership.
+  // This is the v2 promotion path: a newly introduced temporary zero-price model can
+  // enter Strict immediately when its concrete provider/account/model tuple has fresh,
+  // independently verified zero-spend evidence. The evidence resolver is the proof;
+  // the catalog is optional metadata, not a whitelist.
   const candidateConnectionIds = candidate.connectionId
     ? [candidate.connectionId]
     : candidate.allowedConnectionIds ?? [];

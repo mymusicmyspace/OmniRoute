@@ -86,6 +86,29 @@ test("genuine no-auth keyless candidate passes without live economic evidence", 
   );
 });
 
+test("genuine no-auth curated uncapped candidate also passes without account evidence", () => {
+  const entry: FreeModelBudget = {
+    ...keylessEntry("public-uncapped"),
+    freeType: "recurring-uncapped",
+  };
+  const candidate: StrictZeroCostCandidate = {
+    provider: "fixture-keyless",
+    model: "public-uncapped",
+    connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID,
+  };
+  assert.deepEqual(
+    evaluateCandidateConnections(
+      candidate,
+      entry,
+      () => {
+        throw new Error("synthetic no-auth routes must not query a billable account");
+      },
+      OPTIONS
+    ),
+    [SYNTHETIC_NOAUTH_CONNECTION_ID]
+  );
+});
+
 test("credentialed candidate follows typed economic evidence", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "fixture-quota",
@@ -134,15 +157,15 @@ test("credentialed candidate follows typed economic evidence", () => {
   );
 });
 
-test("candidate missing from current free catalog evidence is excluded in the v1-compatible stage", () => {
+test("credentialed model missing from static catalog is admitted by fresh typed v2 evidence", () => {
   const candidate: StrictZeroCostCandidate = {
     provider: "unknown-provider",
-    model: "unknown-model",
+    model: "brand-new-promo-model",
     connectionId: REAL_CONN,
   };
   assert.deepEqual(
     evaluateCandidateConnections(candidate, undefined, () => safeEvidence(), OPTIONS),
-    []
+    [REAL_CONN]
   );
 });
 

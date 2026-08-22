@@ -164,13 +164,6 @@ export function createZeroSpendEvidenceResolver(
     model: string
   ): ZeroSpendEvidenceKey => ({ provider, connectionId, model });
 
-  const invalidateProviderAccounts = (provider: string) => {
-    // Existing cache entries are model/account keyed. Source registration is normally
-    // startup-only; callers with live metadata changes should invalidate the concrete
-    // account/model through the public invalidate() method.
-    void provider;
-  };
-
   return {
     resolve(provider, connectionId, model) {
       return cache.get(toKey(provider, connectionId, model));
@@ -185,26 +178,34 @@ export function createZeroSpendEvidenceResolver(
       const current = sources.get(provider) ?? [];
       if (current.some((existing) => existing.id === source.id)) return;
       sources.set(provider, [...current, source]);
-      invalidateProviderAccounts(provider);
+      cache.invalidateProvider(provider);
     },
     registerAccountSpendSafetySource(provider, source) {
       const current = spendSafetySources.get(provider) ?? [];
       if (current.some((existing) => existing.id === source.id)) return;
       spendSafetySources.set(provider, [...current, source]);
-      invalidateProviderAccounts(provider);
+      cache.invalidateProvider(provider);
     },
     registerEffectiveModelPriceSource(provider, source) {
       const current = priceSources.get(provider) ?? [];
       if (current.some((existing) => existing.id === source.id)) return;
       priceSources.set(provider, [...current, source]);
-      invalidateProviderAccounts(provider);
+      cache.invalidateProvider(provider);
     },
     resetSources(provider) {
       if (provider !== undefined) {
         sources.delete(provider);
         spendSafetySources.delete(provider);
         priceSources.delete(provider);
+        cache.invalidateProvider(provider);
         return;
+      }
+      for (const key of new Set([
+        ...sources.keys(),
+        ...spendSafetySources.keys(),
+        ...priceSources.keys(),
+      ])) {
+        cache.invalidateProvider(key);
       }
       sources.clear();
       spendSafetySources.clear();

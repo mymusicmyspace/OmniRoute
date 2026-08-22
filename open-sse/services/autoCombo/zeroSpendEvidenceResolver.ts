@@ -4,10 +4,6 @@ import {
   ZeroSpendEvidenceCache,
   type ZeroSpendEvidenceKey,
 } from "./zeroSpendEvidenceCache.ts";
-import {
-  openRouterEffectivePriceSource,
-  openRouterSpendSafetySource,
-} from "./zeroSpendEvidenceBuiltins.ts";
 
 export interface ZeroSpendEvidenceSource {
   id: string;
@@ -282,9 +278,6 @@ const productionResolver = createZeroSpendEvidenceResolver({
   getConnection: defaultGetConnection,
   ttlMs: DEFAULT_TTL_MS,
 });
-
-productionResolver.registerEffectiveModelPriceSource("openrouter", openRouterEffectivePriceSource);
-productionResolver.registerAccountSpendSafetySource("openrouter", openRouterSpendSafetySource);
 
 export function resolveZeroSpendEvidence(
   provider: string,

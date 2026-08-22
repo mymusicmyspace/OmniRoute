@@ -20,6 +20,7 @@ import {
   setUserFitnessOverrideEntry,
   deleteUserFitnessOverrideEntry,
 } from "../../../src/lib/db/modelIntelligence.ts";
+import { qualityAliasCandidates } from "./modelQualityAlias.ts";
 
 const FITNESS_TABLE: Record<string, Record<string, number>> = {
   coding: {
@@ -40,22 +41,18 @@ const FITNESS_TABLE: Record<string, Record<string, number>> = {
     "deepseek-coder": 0.9,
     "deepseek-v3": 0.85,
     "deepseek-r1": 0.88,
-    "deepseek-chat": 0.84, // DeepSeek V3.2 Chat — strong code performance
-    "deepseek-v3.2": 0.86, // Explicit V3.2 alias
+    "deepseek-chat": 0.84,
+    "deepseek-v3.2": 0.86,
     qwen: 0.78,
     llama: 0.72,
     mistral: 0.75,
     mixtral: 0.77,
-    // Grok-4 fast — good code, ultra-low latency (1143ms P50)
     "grok-4-fast": 0.8,
     "grok-4": 0.82,
     "grok-3": 0.8,
-    // Kimi K2.5 — agentic with tool calling, good at code tasks
     "kimi-k2": 0.82,
-    // GLM-5.1 / GLM-5 — Z.AI reasoning models, 200K context / 128k output
     "glm-5.1": 0.78,
     "glm-5": 0.78,
-    // MiniMax M2.5 — reasoning support helps complex code
     "minimax-m2.5": 0.75,
     "minimax-m2": 0.72,
   },
@@ -88,15 +85,15 @@ const FITNESS_TABLE: Record<string, Record<string, number>> = {
     "claude-sonnet": 0.92,
     "gemini-2.5-pro": 0.95,
     "gemini-pro": 0.88,
-    "gemini-3.1-pro": 0.95, // Gemini 3.1 Pro — 1M context, ideal for long analysis
+    "gemini-3.1-pro": 0.95,
     "gpt-4o": 0.85,
     o1: 0.9,
     o3: 0.93,
     "deepseek-r1": 0.88,
     "deepseek-chat": 0.8,
-    "kimi-k2": 0.82, // Kimi K2.5 agentic — good for analysis
-    "glm-5.1": 0.82, // GLM-5.1 free reasoning, 200K context for long analysis
-    "glm-5": 0.78, // GLM-5 with 128k output for long analysis
+    "kimi-k2": 0.82,
+    "glm-5.1": 0.82,
+    "glm-5": 0.78,
     "minimax-m2.5": 0.76,
   },
   debugging: {
@@ -127,18 +124,16 @@ const FITNESS_TABLE: Record<string, Record<string, number>> = {
     "deepseek-v3": 0.75,
     "deepseek-chat": 0.74,
     "gemini-flash": 0.72,
-    // New models from ClawRouter analysis (2026-03-17):
-    "grok-4-fast": 0.72, // ultra-fast, suitable for all tasks
+    "grok-4-fast": 0.72,
     "grok-4": 0.74,
     "grok-3": 0.73,
-    "kimi-k2": 0.76, // agentic multi-step tasks
+    "kimi-k2": 0.76,
     "glm-5.1": 0.75,
     "glm-5": 0.7,
     "minimax-m2.5": 0.7,
   },
 };
 
-// Wildcard patterns: model substrings → task type boosts
 const WILDCARD_BOOSTS: Array<{ pattern: string; taskType: string; boost: number }> = [
   { pattern: "coder", taskType: "coding", boost: 0.15 },
   { pattern: "code", taskType: "coding", boost: 0.1 },
@@ -147,16 +142,6 @@ const WILDCARD_BOOSTS: Array<{ pattern: string; taskType: string; boost: number 
   { pattern: "thinking", taskType: "analysis", boost: 0.1 },
 ];
 
-// ─── Models.dev tier → task fitness mapping (resolution layer 3) ────────
-
-/**
- * Intelligence tier derived from models.dev capability data.
- * Tier assignment rules:
- * - `reasoning === true` → "premium"
- * - `tool_call === true && context >= 128000` → "standard"
- * - `tool_call === true` → "fast"
- * - everything else → "budget"
- */
 const TIER_TASK_FITNESS: Record<string, Record<string, number>> = {
   premium: {
     coding: 0.92,
@@ -195,7 +180,6 @@ const TIER_TASK_FITNESS: Record<string, Record<string, number>> = {
     default: 0.55,
   },
 };
-// ─── DB access helpers ──────────────────────────────────────────────────
 
 const _intelligenceCache = new Map<string, number | null>();
 
@@ -216,8 +200,6 @@ function queryModelIntelligence(model: string, category: string, source: string)
     return null;
   }
 }
-
-// ─── Models.dev capability → tier → fitness resolution ──────────────────
 
 let _capabilitiesCache: Record<string, ModelCapRow> | null = null;
 
@@ -295,23 +277,6 @@ export function getModelsDevTierFitness(model: string, taskType: string): number
   return tierScores[normalizedTask] ?? tierScores.default ?? null;
 }
 
-// ─── Resolution chain ───────────────────────────────────────────────────
-
-/**
- * Resolve a model id against the static fitness table, LONGEST PATTERN FIRST (#8603).
- *
- * The shadowing itself is already fixed on `release/v3.8.49` (9f5be229b): matching used
- * to return the first `String.includes` hit in declaration order, so a shorter pattern
- * declared earlier shadowed a model's own, more specific row — `FITNESS_TABLE.coding`
- * declares `"gpt-4o": 0.9` before `"gpt-4o-mini": 0.8`, so `gpt-4o-mini` inherited the
- * flagship's 0.9 and its own row was unreachable (same for `deepseek-v3.2` vs
- * `deepseek-v3`). The length-ranked scan below is that upstream fix, unchanged.
- *
- * What this PR adds is only the exported seam: the surrounding resolution chain hits the
- * DB (user_override / arena_elo / models.dev tier) before reaching layer 4, so pinning
- * the ordering guarantee through `getTaskFitness` would depend on DB fixture state.
- * `taskFitness-pattern-order-8603.test.ts` calls this directly instead.
- */
 export function getStaticFitnessTableScore(model: string, taskType: string): number | null {
   const normalizedModel = model.toLowerCase();
   const normalizedTask = taskType.toLowerCase();
@@ -337,6 +302,38 @@ function lookupWildcardBoosts(normalizedModel: string, normalizedTask: string): 
   return Math.min(1.0, baseScore);
 }
 
+function qualityAliases(normalizedModel: string): string[] {
+  return qualityAliasCandidates(normalizedModel).slice(1);
+}
+
+function lookupAliasIntelligence(
+  normalizedModel: string,
+  normalizedTask: string,
+  source: string
+): number | null {
+  for (const alias of qualityAliases(normalizedModel)) {
+    const score = queryModelIntelligence(alias, normalizedTask, source);
+    if (score !== null) return score;
+  }
+  return null;
+}
+
+function lookupAliasTierFitness(normalizedModel: string, normalizedTask: string): number | null {
+  for (const alias of qualityAliases(normalizedModel)) {
+    const score = getModelsDevTierFitness(alias, normalizedTask);
+    if (score !== null) return score;
+  }
+  return null;
+}
+
+function lookupAliasStaticFitness(normalizedModel: string, normalizedTask: string): number | null {
+  for (const alias of qualityAliases(normalizedModel)) {
+    const score = lookupStaticFitnessTable(alias, normalizedTask);
+    if (score !== null) return score;
+  }
+  return null;
+}
+
 export function getTaskFitness(model: string, taskType: string): number {
   return getTaskFitnessWithSource(model, taskType).score;
 }
@@ -353,53 +350,34 @@ export function getTaskFitnessWithSource(
     return { score: userOverride, source: "user_override" };
   }
 
-  // Try arena_elo with the literal model id first (e.g. "mimo-v2.5"). If that's
-  // a miss and the model id carries a "-free" suffix (e.g. "mimo-v2.5-free"),
-  // try the un-suffixed base id so free-tier variants inherit the arena_elo
-  // score of their paid counterpart. This is what operators expect: the
-  // upstream's `mimo-v2.5` is benchmarked once, and `mimo-v2.5-free` should
-  // pick up the same signal rather than falling through to the wildcard 0.5
-  // and losing every free-vs-paid comparison.
   const arenaElo = queryModelIntelligence(normalizedModel, normalizedTask, "arena_elo");
   if (arenaElo !== null) {
     return { score: arenaElo, source: "arena_elo" };
   }
-  const arenaEloBase = lookupFreeAliasArenaElo(normalizedModel, normalizedTask);
-  if (arenaEloBase !== null) {
-    return { score: arenaEloBase, source: "arena_elo_free_alias" };
+  const arenaAlias = lookupAliasIntelligence(normalizedModel, normalizedTask, "arena_elo");
+  if (arenaAlias !== null) {
+    return { score: arenaAlias, source: "arena_elo_free_alias" };
   }
 
   const tierScore = getModelsDevTierFitness(normalizedModel, normalizedTask);
   if (tierScore !== null) {
     return { score: tierScore, source: "models_dev_tier" };
   }
+  const tierAlias = lookupAliasTierFitness(normalizedModel, normalizedTask);
+  if (tierAlias !== null) {
+    return { score: tierAlias, source: "models_dev_tier_free_alias" };
+  }
 
   const staticScore = lookupStaticFitnessTable(normalizedModel, normalizedTask);
   if (staticScore !== null) {
     return { score: staticScore, source: "fitness_table" };
   }
+  const staticAlias = lookupAliasStaticFitness(normalizedModel, normalizedTask);
+  if (staticAlias !== null) {
+    return { score: staticAlias, source: "fitness_table_free_alias" };
+  }
 
   return { score: lookupWildcardBoosts(normalizedModel, normalizedTask), source: "wildcard_boost" };
-}
-
-/** Suffix used to mark free-tier model variants (e.g. "mimo-v2.5-free"). */
-const FREE_SUFFIX = "-free";
-
-/**
- * Strip a trailing "-free" suffix from the model id and re-query arena_elo.
- * Returns `null` when the original id has no "-free" suffix, when the base id
- * is identical to the original, or when no arena_elo row exists for the base.
- *
- * Examples:
- *   "mimo-v2.5-free"   → look up "mimo-v2.5"
- *   "deepseek-v4-flash-free" → look up "deepseek-v4-flash"
- *   "big-pickle"       → no "-free" suffix → return null (skip)
- */
-function lookupFreeAliasArenaElo(normalizedModel: string, normalizedTask: string): number | null {
-  if (!normalizedModel.endsWith(FREE_SUFFIX)) return null;
-  const baseId = normalizedModel.slice(0, -FREE_SUFFIX.length);
-  if (baseId.length === 0 || baseId === normalizedModel) return null;
-  return queryModelIntelligence(baseId, normalizedTask, "arena_elo");
 }
 
 export function setUserFitnessOverride(model: string, category: string, score: number): void {

@@ -21,6 +21,13 @@ export interface FreeModelBudget {
   poolKey: string | null;
   tos: TosVerdict;
   /**
+   * True only when the documented provider semantics guarantee that exhausting
+   * this free allowance stops/rejects requests instead of silently charging a
+   * paid balance. It is metadata, not live allowance proof: Strict still needs
+   * fresh per-account/model evidence for credentialed candidates.
+   */
+  hardStopGuaranteed?: boolean;
+  /**
    * Provider states it may train on user prompts. Surfaced in the UI so the
    * privacy cost of a "free" tier is visible next to the quota. Kilo's gateway
    * reports this per model as `mayTrainOnYourPrompts` on its public catalog.

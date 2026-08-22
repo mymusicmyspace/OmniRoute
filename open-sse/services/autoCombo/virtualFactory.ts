@@ -26,6 +26,13 @@ import { buildFamilyCandidateFilter, type ModelFamily } from "./modelFamily";
 import { getHiddenModelsByProvider } from "@/models";
 import { getSyncedAvailableModelsByConnection, getCustomModels } from "@/lib/db/models";
 import { filterPaidOnlyCandidates } from "./paidModelFilter";
+import { filterStrictZeroCostCandidates, filterTosAvoidCandidates } from "./strictZeroCostFilter";
+import {
+  peekZeroSpendEvidence,
+  resolveZeroSpendEvidence,
+} from "./zeroSpendEvidenceResolver";
+import type { ZeroSpendEvidence } from "./zeroSpendEvidence";
+import { promotionUrgencyMultiplier } from "./promotionUrgency";
 import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import { filterExcludedCandidates } from "./candidateOverrides";
 import { getExcludedConnectionIds } from "@/lib/db/autoCandidateOverrides";
@@ -77,6 +84,11 @@ type NoAuthProviderDefinition = {
   serviceKinds?: string[];
 };
 
+type StrictEvidenceMetadata = Pick<
+  ZeroSpendEvidence,
+  "promotional" | "expiresAt" | "kind" | "source"
+>;
+
 export interface VirtualAutoComboCandidate {
   provider: string;
   /** A concrete connection for synthetic/no-auth candidates; null for a logical provider/model candidate. */
@@ -86,6 +98,8 @@ export interface VirtualAutoComboCandidate {
   model: string;
   modelStr: string; // e.g., 'openai/gpt-4o'
   costPer1MTokens: number; // from providerRegistry
+  /** Strict-only verified economic metadata used for bounded promotion urgency. */
+  zeroSpendEvidence?: StrictEvidenceMetadata;
   /** Build-local capability snapshot. Runtime calls rebuild it; catalog entries reuse it. */
   resolvedContextLength?: number | null;
   resolvedMaxOutputTokens?: number | null;
@@ -140,6 +154,7 @@ type VirtualAutoCombo = AutoComboConfig & {
 export interface PreparedVirtualAutoComboInputs {
   readonly regularCandidates: readonly VirtualAutoComboCandidate[];
   readonly familyCandidates: readonly VirtualAutoComboCandidate[];
+  readonly strictZeroCost: boolean;
 }
 
 function toExpiryMs(value: unknown): number | null {
@@ -234,10 +249,6 @@ function getNoAuthCandidates(
       (typeof providerDef.alias === "string" && blockedProviders.has(providerDef.alias))
     )
       continue;
-    // #6557: a no-auth provider with its OWN provider_connections row explicitly
-    // disabled (isActive=false, the toggle on the main Providers grid card once an
-    // Account/fingerprint exists) must not be routed to, even though it has no
-    // entry in the separate `settings.blockedProviders` list.
     if (
       disabledNoAuthProviders.has(providerId) ||
       (typeof providerDef.alias === "string" && disabledNoAuthProviders.has(providerDef.alias))
@@ -248,31 +259,18 @@ function getNoAuthCandidates(
     const registryModels = Array.isArray(providerInfo?.models) ? providerInfo.models : [];
     if (registryModels.length === 0) continue;
 
-    // No-auth providers do not have provider_connections rows. Use the same
-    // synthetic connection id returned by getProviderCredentials() so the
-    // downstream combo path can still carry a stable target/account identity.
-    // Prefer provider aliases because some canonical provider IDs are reserved
-    // for credentialed tiers with different routing semantics.
     const registryAlias =
       typeof providerInfo?.alias === "string" && providerInfo.alias.trim().length > 0
         ? providerInfo.alias
         : null;
     const routingPrefix = providerDef.alias || registryAlias || providerId;
 
-    // #7622: honor the "Excluded Models" field (`providerSpecificData.excludedModels`)
-    // already enforced at dispatch time (src/sse/services/auth.ts) for no-auth
-    // providers' own provider_connections row (#6557), so an excluded model never
-    // enters the auto-combo/fusion candidate pool in the first place.
     const providerSpecificData =
       noAuthProviderSpecificData.get(providerId) ??
       (typeof providerDef.alias === "string"
         ? noAuthProviderSpecificData.get(providerDef.alias)
         : undefined);
 
-    // #7620: honor the eye-icon "hidden" flag (isHidden, from the
-    // modelCompatOverrides/customModels key_value namespaces) the same way the
-    // credentialed-connection loop below does, so a hidden no-auth model never
-    // enters the auto-combo/fusion candidate pool either.
     const hiddenModels =
       hiddenModelsMap.get(providerId) ??
       (typeof providerDef.alias === "string" ? hiddenModelsMap.get(providerDef.alias) : undefined);
@@ -295,34 +293,6 @@ function getNoAuthCandidates(
   return candidates;
 }
 
-/**
- * Creates a virtual AutoCombo configuration dynamically based on connected providers and a specified variant.
- * This combo is not persisted in the DB.
- */
-/**
- * Aggregate the context window / max output to ADVERTISE for an auto combo.
- *
- * MAX across candidates (not min): the auto-combo context pre-filter
- * (combo.ts::filterTargetsByRequestCompatibility + the estimated-tokens
- * pre-filter) already routes oversized requests away from small-window
- * candidates, so advertising the largest window lets clients (e.g. opencode)
- * keep their smart auto-compaction calibrated to the best candidate instead
- * of compacting prematurely — or, worse, receiving 0 and disabling
- * compaction entirely (the "agent keeps forgetting things" bug).
- *
- * Unknown candidates resolve through getTokenLimit()'s fallback chain, so a
- * non-empty pool always yields a positive contextLength.
- *
- * maxOutputTokens has no such guaranteed fallback in getResolvedModelCapabilities()
- * — registry entries and models.dev sync data are both optional per model, so a
- * candidate pool whose members all lack that specific field (e.g. #6453's
- * provider-family combos, `auto/llama` and friends, over no-auth/free-tier
- * registry entries that were never annotated with maxOutputTokens) would
- * otherwise advertise `null`, which mirrors the `context: 0` bug this module's
- * docstring describes for contextLength (opencode disables smart auto-compaction
- * entirely when a limit is falsy). Fall back to a conservative generic default so
- * a non-empty pool always yields a positive maxOutputTokens too.
- */
 const DEFAULT_ADVERTISED_MAX_OUTPUT_TOKENS = 8192;
 
 type AdvertisedLimitCandidate = {
@@ -378,10 +348,8 @@ type PreparedCapabilityValues = {
 };
 
 type PreparedCapabilityState = {
-  /** Nested provider → model memo; collision-free for arbitrary model ids. */
   byTarget: Map<string, Map<string, PreparedCapabilityValues>>;
   resolvedSinceYield: number;
-  /** Build-local bulk maps; one per catalog prepare, never retained at runtime. */
   resolutionSnapshot: ModelCapabilityResolutionSnapshot;
 };
 
@@ -441,18 +409,40 @@ async function attachPreparedCapabilityValues(
   return prepared;
 }
 
+function attachStrictEvidenceMetadata(
+  candidates: VirtualAutoComboCandidate[]
+): VirtualAutoComboCandidate[] {
+  return candidates.map((candidate) => {
+    const ids = candidate.connectionId
+      ? [candidate.connectionId]
+      : candidate.allowedConnectionIds ?? [];
+    for (const connectionId of ids) {
+      if (connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID) continue;
+      const evidence = peekZeroSpendEvidence(candidate.provider, connectionId, candidate.model);
+      if (evidence?.status !== "SAFE") continue;
+      return {
+        ...candidate,
+        zeroSpendEvidence: {
+          promotional: evidence.promotional,
+          expiresAt: evidence.expiresAt,
+          kind: evidence.kind,
+          source: evidence.source,
+        },
+      };
+    }
+    return candidate;
+  });
+}
+
 export async function prepareVirtualAutoComboInputs(
   options: { includeResolvedCapabilities?: boolean } = {}
 ): Promise<PreparedVirtualAutoComboInputs> {
   const [connections, disabledNoAuthConnections, settings] = await Promise.all([
     getCachedProviderConnections({ isActive: true }) as Promise<VirtualFactoryConn[]>,
-    // #6557: no-auth providers (opencode/mimocode/etc.) don't get an isActive
-    // filter applied above since their credential is synthetic, but a real
-    // provider_connections row CAN exist for them (created via "Add Account")
-    // and its own isActive=false must gate the auto-combo pool too — not just
     getCachedProviderConnections({ isActive: false }) as Promise<VirtualFactoryConn[]>,
     getSettings().catch(() => ({}) as Record<string, unknown>),
   ]);
+  const strictZeroCost = settings.freeAccessPolicy === "strict";
   const blockedProviders = new Set(
     Array.isArray(settings.blockedProviders) ? (settings.blockedProviders as string[]) : []
   );
@@ -462,10 +452,6 @@ export async function prepareVirtualAutoComboInputs(
       .map((conn) => conn.provider)
   );
   const hiddenModelsMap = getHiddenModelsByProvider();
-  // #7622: a no-auth provider's own provider_connections row (#6557) can carry
-  // `providerSpecificData.excludedModels` regardless of its isActive state (the
-  // dispatch-time enforcement in auth.ts does not gate on isActive either), so
-  // gather it from BOTH the active and disabled connection lists.
   const noAuthProviderSpecificData = new Map<string, Record<string, unknown> | null | undefined>();
   for (const conn of [...connections, ...disabledNoAuthConnections]) {
     if (conn.provider in NOAUTH_PROVIDERS) {
@@ -484,9 +470,6 @@ export async function prepareVirtualAutoComboInputs(
     connectionsByProvider.set(conn.provider, providerConnections);
   }
 
-  // Build one logical candidate per provider/model and keep account fallback as an
-  // allowlist on that candidate. This avoids both the old "first registry model per
-  // connection" blind spot and a connections × models Cartesian candidate pool.
   for (const [providerId, providerConnections] of connectionsByProvider) {
     const providerInfo = registry[providerId];
     const registryModelIds = Array.isArray(providerInfo?.models)
@@ -500,11 +483,6 @@ export async function prepareVirtualAutoComboInputs(
       .filter(Boolean);
     const hiddenModels = hiddenModelsMap.get(providerId);
 
-    // #auto-pool-visible-only: build the credentialed pool from the models the user
-    // actually has available (synced + custom non-hidden) when any exist, falling
-    // back to the static catalog only when the user has none. This keeps catalog-only
-    // models (e.g. openrouter/auto) out of every auto/* pool when the operator only
-    // synced a subset (e.g. OpenRouter with importFreeModelsOnly).
     const [syncedByConnection, customModels] = await Promise.all([
       getSyncedAvailableModelsByConnection(providerId),
       getCustomModels(providerId),
@@ -526,15 +504,11 @@ export async function prepareVirtualAutoComboInputs(
         .filter((conn) => {
           if (isModelExcludedByConnection(modelId, conn.providerSpecificData)) return false;
           if (hasUserModels) {
-            // User-synced models are scoped to the connections that carry them;
-            // custom models are provider-wide like registry models.
             const connSynced = syncedByConnection[conn.id] ?? [];
             const isSyncedForConn = connSynced.some((m) => m.id === modelId);
             const isCustomForProvider = customModels.some((m) => m.id === modelId);
             return isSyncedForConn || isCustomForProvider || conn.defaultModel?.trim() === modelId;
           }
-          // Registry models are provider-wide. A non-registry default (for a custom
-          // or passthrough model) is scoped only to connections that selected it.
           return registryModelIdSet.has(modelId) || conn.defaultModel?.trim() === modelId;
         })
         .map((conn) => conn.id);
@@ -546,13 +520,11 @@ export async function prepareVirtualAutoComboInputs(
         allowedConnectionIds,
         model: modelId,
         modelStr: `${providerId}/${modelId}`,
-        costPer1MTokens: 0, // Not used in virtual auto-combo (LKGP uses session stickiness)
+        costPer1MTokens: 0,
       });
     }
   }
 
-  // #7623: honor existing model lockouts + connection cooldown/terminal state so
-  // auto/* never advertises models the dispatch path would immediately skip.
   const connectionsById = new Map<string, ConnectionResilienceView>();
   for (const conn of [...connections, ...disabledNoAuthConnections]) {
     connectionsById.set(conn.id, conn);
@@ -575,23 +547,33 @@ export async function prepareVirtualAutoComboInputs(
     const resilienceFilteredPool = filterResilienceBlockedCandidates(pool, connectionsById);
     if (resilienceFilteredPool !== pool) pool = resilienceFilteredPool;
 
-    // #6512 (follow-up to #6328/#6495): when the operator opts into `hidePaidModels`,
-    // exclude paid-only backends from EVERY `auto/*` candidate pool.
     const paidFilteredPool = filterPaidOnlyCandidates(pool, settings.hidePaidModels === true);
     if (paidFilteredPool !== pool) pool = paidFilteredPool;
+
+    if (strictZeroCost) {
+      const strictFilteredPool = filterStrictZeroCostCandidates(pool, {
+        enabled: true,
+        resolveZeroSpendEvidence,
+        minRemainingAllowance: 1,
+        maxEvidenceAgeMs:
+          (typeof settings.autoRefreshProviderQuotaInterval === "number"
+            ? settings.autoRefreshProviderQuotaInterval
+            : 180) * 1000,
+      });
+      pool = attachStrictEvidenceMetadata(strictFilteredPool);
+    }
+
+    const tosFilteredPool = filterTosAvoidCandidates(pool, settings.excludeTosAvoid === true);
+    if (tosFilteredPool !== pool) pool = tosFilteredPool;
     return pool;
   };
 
   const regularCandidates = buildPreparedPool(false);
-  // #6453/#8183: family selectors bypass the reliability-curated no-auth allowlist.
   const familyCandidates = buildPreparedPool(true);
   if (!options.includeResolvedCapabilities) {
-    return { regularCandidates, familyCandidates };
+    return { regularCandidates, familyCandidates, strictZeroCost };
   }
 
-  // One uninterrupted bulk read of all three capability tables for this prepare only.
-  // Do not yield between the three loads; later cooperative yields remain fine because
-  // catalog generation guards already prevent publishing across intervening writes.
   const capabilityState: PreparedCapabilityState = {
     byTarget: new Map(),
     resolvedSinceYield: 0,
@@ -600,16 +582,10 @@ export async function prepareVirtualAutoComboInputs(
   return {
     regularCandidates: await attachPreparedCapabilityValues(regularCandidates, capabilityState),
     familyCandidates: await attachPreparedCapabilityValues(familyCandidates, capabilityState),
+    strictZeroCost,
   };
 }
 
-/**
- * Score candidates at snapshot time using available data (capabilities, tier)
- * and the mode-pack's dominant factors. Runtime telemetry (p95 latency, quota
- * remaining) is not available during combo creation — this uses static signals only.
- *
- * Returns a map from modelStr → normalized weight score [0, 1].
- */
 export function computeSnapshotWeights(
   candidates: readonly VirtualAutoComboCandidate[],
   weights: ScoringWeights
@@ -618,13 +594,11 @@ export function computeSnapshotWeights(
   for (const c of candidates) {
     let score = 0;
 
-    // taskFit: reasoning + vision capable models score higher when taskFit is weighted
     if (weights.taskFit > 0) {
       if (c.resolvedReasoning || c.resolvedSupportsThinking) score += weights.taskFit * 0.6;
       if (c.resolvedSupportsVision) score += weights.taskFit * 0.3;
     }
 
-    // stability: models with richer capabilities are assumed more stable
     if (weights.stability > 0) {
       const capabilityCount =
         Number(c.resolvedReasoning ?? false) +
@@ -633,7 +607,6 @@ export function computeSnapshotWeights(
       score += weights.stability * Math.min(capabilityCount / 2, 1);
     }
 
-    // Tier-based scoring (single classifyTier call covers both checks)
     let tierInfo: { tier: string } | null = null;
     if (weights.tierPriority > 0 || weights.costInv > 0) {
       try {
@@ -646,12 +619,16 @@ export function computeSnapshotWeights(
       score += weights.tierPriority;
     if (tierInfo && weights.costInv > 0 && tierInfo.tier === "free") score += weights.costInv;
 
-    // latencyInv: all candidates get a base score when latency matters
-    // (no runtime data at snapshot time, so equal baseline)
     if (weights.latencyInv > 0) score += weights.latencyInv * 0.5;
-
-    // health + quota: no runtime telemetry at snapshot time → neutral baseline
     score += (weights.health + weights.quota) * 0.5;
+
+    if (c.zeroSpendEvidence) {
+      score *= promotionUrgencyMultiplier({
+        promotional: c.zeroSpendEvidence.promotional,
+        expiresAt: c.zeroSpendEvidence.expiresAt,
+        nowMs: Date.now(),
+      });
+    }
 
     scores.set(c.modelStr, Math.min(score, 1));
   }
@@ -665,6 +642,9 @@ function clonePreparedCandidates(
     ...candidate,
     ...(candidate.allowedConnectionIds
       ? { allowedConnectionIds: [...candidate.allowedConnectionIds] }
+      : {}),
+    ...(candidate.zeroSpendEvidence
+      ? { zeroSpendEvidence: { ...candidate.zeroSpendEvidence } }
       : {}),
   }));
 }
@@ -680,10 +660,6 @@ export async function createVirtualAutoComboFromPrepared(
     spec?.family ? prepared.familyCandidates : prepared.regularCandidates
   );
 
-  // #7819 (Level 2): per-API-key candidate exclusions. Fail-open — an absent
-  // apiKeyId/autoChannel (every caller before #7819) or a DB lookup failure
-  // both leave the pool untouched, so default (unconfigured) routing stays
-  // byte-identical to pre-#7819 behavior.
   let excludedConnectionIds: Set<string> = new Set();
   if (apiKeyId && autoChannel) {
     try {
@@ -699,11 +675,19 @@ export async function createVirtualAutoComboFromPrepared(
   }
 
   if (candidatePool.length === 0) {
-    log.warn("AUTO", "No connected providers with valid credentials for virtual auto-combo");
+    log.warn(
+      "AUTO",
+      prepared.strictZeroCost
+        ? "STRICT_ZERO_COST: no verified zero-spend candidates; returning empty auto-combo"
+        : "No connected providers with valid credentials for virtual auto-combo"
+    );
     const emptyPool: string[] = [];
+    const emptyWeights = prepared.strictZeroCost
+      ? { ...MODE_PACKS["quality-first"] }
+      : { ...DEFAULT_WEIGHTS };
     const autoConfig = {
       candidatePool: emptyPool,
-      weights: { ...DEFAULT_WEIGHTS },
+      weights: emptyWeights,
       explorationRate: 0.05,
       routerStrategy: "lkgp",
     };
@@ -724,23 +708,12 @@ export async function createVirtualAutoComboFromPrepared(
     };
   }
 
-  // #4235 Phase B: narrow the pool by the `auto/<category>:<tier>` overlay
-  // (vision/reasoning capability, free/premium model tier).
-  //
-  // Default behavior: when the filter yields zero candidates, return an EMPTY
-  // pool — never silently fall back to the full pool. This makes
-  // `auto/coding:free` actually mean "free tier only" and prevents a paid
-  // expensive model from being picked just because no free provider is
-  // connected. Operators who want the old "never break routing, lose the bias"
-  // behavior can opt back in via the env var below.
   let effectivePool = candidatePool;
-  // #6453: `auto/<family>` narrows by model family instead of category/tier. The
-  // two overlays are mutually exclusive on the spec (family takes precedence when
-  // both are somehow present, which callers never do in practice).
+  const strictFreeTier = prepared.strictZeroCost && spec?.tier === "free";
   const candidateFilter = spec?.family
     ? buildFamilyCandidateFilter(spec.family)
     : spec
-      ? buildAutoCandidateFilter(spec.category, spec.tier)
+      ? buildAutoCandidateFilter(spec.category, strictFreeTier ? undefined : spec.tier)
       : null;
   if (candidateFilter) {
     const narrowed = candidatePool.filter((candidate) => candidateFilter(candidate));
@@ -750,30 +723,29 @@ export async function createVirtualAutoComboFromPrepared(
     if (narrowed.length > 0) {
       effectivePool = narrowed;
     } else if (
+      !prepared.strictZeroCost &&
       !spec?.family &&
       (process.env.OMNIROUTE_AUTO_FREE_FALLBACK_TO_FULL_POOL === "true" ||
         process.env.OMNIROUTE_AUTO_FREE_FALLBACK_TO_FULL_POOL === "1")
     ) {
-      // Opt-in legacy behavior (category/tier only): warn loudly, then keep the full pool.
       log.warn(
         "AUTO",
         `${label} matched no connected models; falling back to the full pool (OMNIROUTE_AUTO_FREE_FALLBACK_TO_FULL_POOL=true)`
       );
     } else {
-      // Family combos always degrade to an empty pool when unavailable — a family
-      // is a hard identity constraint, not a soft optimization bias, so there is
-      // no sensible "fall back to the full pool" behavior for it.
       warnEmptyAutoPoolOnce(
         label,
-        `${label} matched no connected models; returning an empty pool.${spec?.family ? "" : ' Set OMNIROUTE_AUTO_FREE_FALLBACK_TO_FULL_POOL=true to restore the legacy "use full pool" behavior.'}`
+        prepared.strictZeroCost
+          ? `${label} matched no verified zero-spend models; returning an empty pool.`
+          : `${label} matched no connected models; returning an empty pool.${spec?.family ? "" : ' Set OMNIROUTE_AUTO_FREE_FALLBACK_TO_FULL_POOL=true to restore the legacy "use full pool" behavior.'}`
       );
       effectivePool = [];
     }
   }
 
   let weights: ScoringWeights = { ...DEFAULT_WEIGHTS };
-  let explorationRate = 0.05; // Default exploration rate
-  let routerStrategy = "lkgp"; // All auto variants use LKGP
+  let explorationRate = 0.05;
+  let routerStrategy = "lkgp";
 
   switch (variant) {
     case "coding":
@@ -790,27 +762,18 @@ export async function createVirtualAutoComboFromPrepared(
       break;
     case "smart":
       weights = { ...MODE_PACKS["quality-first"] };
-      explorationRate = 0.1; // Override default exploration rate
+      explorationRate = 0.1;
       break;
     case "lkgp":
-      // LKGP is default for all auto variants, this variant just explicitly names it.
-      // Use default weights.
       break;
     case "chaos":
-      // Chaos mode: select top-N most stable models and fan them out in parallel
-      // (strategy "fusion"). Prioritize health + stability via the chaos-mode pack.
       weights = { ...MODE_PACKS["chaos-mode"] };
-      explorationRate = 0; // no exploration — only the proven-stable set
+      explorationRate = 0;
       break;
-    case undefined: // Default auto
-      // Use default weights
+    case undefined:
       break;
   }
 
-  // #4235 Phase B: category/tier weight overlay. A non-chat category leans
-  // quality-first; the tier then refines toward latency (fast), cost (cheap/floor)
-  // or availability (reliable). free/pro keep the base weights — their bias is the
-  // candidate filter above (free → free-tier models, pro → premium models).
   if (spec) {
     if (spec.category && spec.category !== "chat") {
       weights = { ...MODE_PACKS["quality-first"] };
@@ -823,6 +786,13 @@ export async function createVirtualAutoComboFromPrepared(
     } else if (weightVariant === "reliability") {
       weights = { ...MODE_PACKS["reliability-first"] };
     }
+  }
+
+  // Once Strict has proven every surviving candidate is zero-spend-safe, nominal
+  // price no longer carries useful information. Prefer the existing quality-first
+  // pack and let promotion urgency act only as a bounded tiebreak-like multiplier.
+  if (prepared.strictZeroCost) {
+    weights = { ...MODE_PACKS["quality-first"] };
   }
 
   const providerPool = [...new Set(effectivePool.map((c) => c.provider))];
@@ -846,13 +816,6 @@ export async function createVirtualAutoComboFromPrepared(
     routerStrategy,
   };
 
-  // Chaos mode fans out to the top-N most stable models in parallel. Panel size
-  // is capped to keep a single IDE request from fanning out to dozens of providers;
-  // operators can override via env var OMNIROUTE_CHAOS_MAX_PANEL (default 5).
-  //
-  // Provider diversity: when multiple candidates from the same provider exist, only
-  // the highest-scored model per provider is included. This prevents a single
-  // provider from monopolizing the panel and gives the IDE truly diverse answers.
   const isChaos = variant === "chaos";
   const CHAOS_MAX_PANEL = (() => {
     const env = process.env.OMNIROUTE_CHAOS_MAX_PANEL;
@@ -861,8 +824,6 @@ export async function createVirtualAutoComboFromPrepared(
   })();
   let chaosModels: typeof models;
   if (isChaos) {
-    // Deduplicate by provider: keep first occurrence per provider (models are
-    // already scored/sorted by health + stability from scoring).
     const seenProviders = new Set<string>();
     const diverse: typeof models = [];
     for (const m of models) {
@@ -889,8 +850,6 @@ export async function createVirtualAutoComboFromPrepared(
     explorationRate,
     routerStrategy,
     autoConfig,
-    // For chaos, stash the panel size + a flag so downstream handlers can detect
-    // the broadcast mode and stream each panel model back to IDEs that opt in.
     config: {
       auto: autoConfig,
       ...(isChaos

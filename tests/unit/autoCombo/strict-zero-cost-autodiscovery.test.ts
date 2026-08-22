@@ -19,7 +19,7 @@ import type { FreeModelBudget } from "../../../open-sse/config/freeModelCatalog.
 const NOW = "2026-08-22T12:00:00.000Z";
 const OPTIONS = { minRemainingAllowance: 1, maxEvidenceAgeMs: 180_000, now: () => Date.parse(NOW) };
 
-function safeEvidence(): ZeroSpendEvidence {
+function safeEvidence(overrides: Partial<ZeroSpendEvidence> = {}): ZeroSpendEvidence {
   return {
     status: "SAFE",
     kind: "free-quota",
@@ -32,6 +32,7 @@ function safeEvidence(): ZeroSpendEvidence {
     expiresAt: null,
     source: "fixture",
     promotional: false,
+    ...overrides,
   };
 }
 
@@ -136,6 +137,31 @@ test("catalog membership without economic evidence remains fail-closed", () => {
       OPTIONS
     ),
     []
+  );
+});
+
+test("fresh verified credentialed promotion is admitted without static catalog membership", () => {
+  const candidate: StrictZeroCostCandidate = {
+    provider: "new-gateway",
+    model: "just-launched-promo",
+    connectionId: "account-a",
+  };
+  assert.deepEqual(
+    evaluateCandidateConnections(
+      candidate,
+      undefined,
+      () =>
+        safeEvidence({
+          kind: "effective-zero-price",
+          remainingFreeAllowance: null,
+          effectiveInputPrice: 0,
+          effectiveOutputPrice: 0,
+          promotional: true,
+          expiresAt: "2026-08-25T00:00:00.000Z",
+        }),
+      OPTIONS
+    ),
+    ["account-a"]
   );
 });
 

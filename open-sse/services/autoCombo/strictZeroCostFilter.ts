@@ -3,17 +3,12 @@ import {
   type FreeModelBudget,
 } from "../../config/freeModelCatalog.ts";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter.ts";
+import {
+  evaluateZeroSpendEvidence,
+  type ZeroSpendEvidence,
+} from "./zeroSpendEvidence.ts";
 
 const KEYLESS_FREE_TYPES = new Set<FreeModelBudget["freeType"]>(["keyless"]);
-
-export type FreeAccessStatus = "SAFE" | "EXHAUSTED" | "UNKNOWN";
-
-export interface FreeAccessState {
-  status: FreeAccessStatus;
-  remainingFreeAllowance: number | null;
-  resetAt: string | null;
-  checkedAt: string;
-}
 
 export interface StrictZeroCostCandidate {
   provider: string;
@@ -24,12 +19,13 @@ export interface StrictZeroCostCandidate {
 
 export interface StrictZeroCostOptions {
   enabled: boolean;
-  resolveFreeAccessState: (
+  resolveZeroSpendEvidence: (
     provider: string,
-    connectionId: string
-  ) => FreeAccessState | undefined;
+    connectionId: string,
+    model: string
+  ) => ZeroSpendEvidence | undefined;
   minRemainingAllowance: number;
-  maxStateAgeMs: number;
+  maxEvidenceAgeMs: number;
   now?: () => number;
   catalog?: readonly FreeModelBudget[];
 }
@@ -43,29 +39,35 @@ export function findBudgetEntry(
   );
 }
 
-function isConnectionStateSafe(
-  provider: string,
+function isConnectionEvidenceSafe(
+  candidate: Pick<StrictZeroCostCandidate, "provider" | "model">,
   connectionId: string,
-  resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
-  options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
+  resolveZeroSpendEvidence: StrictZeroCostOptions["resolveZeroSpendEvidence"],
+  options: Pick<
+    StrictZeroCostOptions,
+    "minRemainingAllowance" | "maxEvidenceAgeMs" | "now"
+  >
 ): boolean {
-  const state = resolveFreeAccessState(provider, connectionId);
-  if (!state || state.status !== "SAFE") return false;
-
-  const checkedAtMs = Date.parse(state.checkedAt);
-  const now = (options.now ?? Date.now)();
-  if (!Number.isFinite(checkedAtMs) || now - checkedAtMs > options.maxStateAgeMs) return false;
-  if (state.remainingFreeAllowance === null) return false;
-  if (options.minRemainingAllowance < 0) return false;
-
-  return state.remainingFreeAllowance > options.minRemainingAllowance;
+  const evidence = resolveZeroSpendEvidence(
+    candidate.provider,
+    connectionId,
+    candidate.model
+  );
+  return evaluateZeroSpendEvidence(evidence, {
+    nowMs: (options.now ?? Date.now)(),
+    maxAgeMs: options.maxEvidenceAgeMs,
+    minRemainingAllowance: options.minRemainingAllowance,
+  }).safe;
 }
 
 export function evaluateCandidateConnections(
   candidate: StrictZeroCostCandidate,
   budgetEntry: FreeModelBudget | undefined,
-  resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
-  options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
+  resolveZeroSpendEvidence: StrictZeroCostOptions["resolveZeroSpendEvidence"],
+  options: Pick<
+    StrictZeroCostOptions,
+    "minRemainingAllowance" | "maxEvidenceAgeMs" | "now"
+  >
 ): string[] {
   if (!budgetEntry) return [];
 
@@ -78,7 +80,6 @@ export function evaluateCandidateConnections(
 
   if (budgetEntry.freeType === "discontinued") return [];
   if (isGenuineNoAuthCandidate) return [];
-  if (budgetEntry.hardStopGuaranteed !== true) return [];
 
   const candidateConnectionIds = candidate.connectionId
     ? [candidate.connectionId]
@@ -88,10 +89,10 @@ export function evaluateCandidateConnections(
   for (const connectionId of candidateConnectionIds) {
     if (connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID) continue;
     if (
-      isConnectionStateSafe(
-        candidate.provider,
+      isConnectionEvidenceSafe(
+        candidate,
         connectionId,
-        resolveFreeAccessState,
+        resolveZeroSpendEvidence,
         options
       )
     ) {
@@ -116,7 +117,7 @@ export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate
     const safeConnectionIds = evaluateCandidateConnections(
       candidate,
       budgetEntry,
-      options.resolveFreeAccessState,
+      options.resolveZeroSpendEvidence,
       options
     );
 

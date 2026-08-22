@@ -4,6 +4,10 @@ import {
   ZeroSpendEvidenceCache,
   type ZeroSpendEvidenceKey,
 } from "./zeroSpendEvidenceCache.ts";
+import {
+  openRouterEffectivePriceSource,
+  openRouterSpendSafetySource,
+} from "./zeroSpendEvidenceBuiltins.ts";
 
 export interface ZeroSpendEvidenceSource {
   id: string;
@@ -95,8 +99,6 @@ export function composeEffectiveZeroPriceEvidence(
   }
   if (price.inputPerMillion !== 0 || price.outputPerMillion !== 0) return undefined;
 
-  // Zero price alone is not a spend guarantee. A separate account-side fact must
-  // prove that a later paid fallback cannot silently charge the account.
   if (safety.paidSpendPossible && !safety.hardStopVerified) return undefined;
 
   return {
@@ -150,7 +152,11 @@ export function createZeroSpendEvidenceResolver(
         key,
         connection
       );
-      const price = await resolveFirstEffectivePrice(priceSources.get(key.provider) ?? [], key, connection);
+      const price = await resolveFirstEffectivePrice(
+        priceSources.get(key.provider) ?? [],
+        key,
+        connection
+      );
       const zeroPriceEvidence = composeEffectiveZeroPriceEvidence(price, safety);
       if (zeroPriceEvidence) return zeroPriceEvidence;
 
@@ -272,6 +278,12 @@ const productionResolver = createZeroSpendEvidenceResolver({
   getConnection: defaultGetConnection,
   ttlMs: DEFAULT_TTL_MS,
 });
+
+// Built-ins are deliberately provider-specific. Adding a provider here requires an
+// independently reviewable price source and spend-safety contract; there is no
+// catch-all conversion from generic balances or free-looking model names.
+productionResolver.registerEffectiveModelPriceSource("openrouter", openRouterEffectivePriceSource);
+productionResolver.registerAccountSpendSafetySource("openrouter", openRouterSpendSafetySource);
 
 export function resolveZeroSpendEvidence(
   provider: string,

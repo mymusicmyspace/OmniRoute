@@ -4,10 +4,6 @@
  * Extracted from handleComboChat's `handleSingleModelWithTimeout` closure (combo.ts).
  * A locally expired timer aborts that target and returns a typed 504 response so the Combo
  * can fall back without treating OmniRoute's own deadline as a provider-connection failure.
- * The per-model abort signal still comes from the target (`target.modelAbortSignal`), so
- * the outer request signal is intentionally NOT a dependency here.
- *
- * See _tasks/superpowers/plans/2026-07-03-blocoJ-combo-hotpath-decomposition.md (Task 1).
  */
 import { buildErrorBody, errorResponse, sanitizeErrorMessage } from "../../utils/error.ts";
 import {
@@ -18,16 +14,11 @@ import type { HandleSingleModel, SingleModelTarget, ComboLogger } from "./types.
 import { getSettings } from "../../../src/lib/db/settings.ts";
 import { parseModel } from "../model.ts";
 import { applyStrictZeroCostRequestGuard } from "../autoCombo/strictZeroCostRequestGuard.ts";
+import { invalidateZeroSpendEvidence } from "../autoCombo/zeroSpendEvidenceResolver.ts";
 
 /** Stable internal classification for OmniRoute's own combo per-target timer. */
 export const COMBO_TARGET_TIMEOUT_CODE = "combo_target_timeout";
 
-/**
- * Diagnostic: track recent combo-per-model-timeout abort errors so an
- * unhandledRejection handler can attribute the stack trace to a specific model
- * and timeout value. Ring buffer of 4 — concurrent per-model timeouts are rare
- * but possible (e.g. hedge + per-target timeout on different targets).
- */
 const CONTEXT_RING_SIZE = 4;
 const lastTimeoutContexts: Array<{
   modelStr: string;
@@ -83,28 +74,45 @@ function ensureDiagnosticListener(): void {
   });
 }
 
+function resolveTargetProvider(modelStr: string, target?: SingleModelTarget): string | undefined {
+  return target && "provider" in target && typeof target.provider === "string"
+    ? target.provider
+    : parseModel(modelStr).provider;
+}
+
 async function guardStrictZeroCostDispatch(
   body: Record<string, unknown>,
   modelStr: string,
   target?: SingleModelTarget
 ): Promise<Record<string, unknown>> {
-  // Do not cache a negative setting read. A just-enabled Strict policy must never
-  // have a window in which an old false value could permit a paid dispatch.
   let strictZeroCost = false;
   try {
     const settings = await getSettings();
     strictZeroCost = settings.freeAccessPolicy === "strict";
   } catch {
-    // Settings lookup failure while we cannot prove Strict is enabled must not alter
-    // legacy combo behavior. Economic fail-closed happens earlier in Strict pool prep.
+    // Pool preparation is the primary fail-closed gate. If settings become unreadable
+    // after preparation, this leaf cannot infer that an unrelated legacy combo was
+    // Strict; leave its historical behavior unchanged rather than globally blocking it.
   }
   if (!strictZeroCost) return body;
+  return applyStrictZeroCostRequestGuard(body, resolveTargetProvider(modelStr, target), true);
+}
 
-  const targetProvider =
-    target && "provider" in target && typeof target.provider === "string"
-      ? target.provider
-      : parseModel(modelStr).provider;
-  return applyStrictZeroCostRequestGuard(body, targetProvider, true);
+function maybeInvalidateEconomicEvidence(
+  response: Response,
+  modelStr: string,
+  target?: SingleModelTarget
+): Response {
+  if (response.status !== 402 && response.status !== 403 && response.status !== 429) {
+    return response;
+  }
+  const connectionId = target && "connectionId" in target ? target.connectionId : null;
+  if (!connectionId) return response;
+  const provider = resolveTargetProvider(modelStr, target);
+  if (!provider) return response;
+  const model = parseModel(modelStr).model || modelStr;
+  invalidateZeroSpendEvidence(provider, connectionId, model);
+  return response;
 }
 
 export function buildTargetTimeoutRunner(deps: {
@@ -137,9 +145,10 @@ export function buildTargetTimeoutRunner(deps: {
         "COMBO",
         `Per-model combo timeout is DISABLED (effectiveTimeoutMs=${effectiveTimeoutMs}) for ${modelStr} — a hung upstream will hang this target until the combo loop safety timeout`
       );
-      return handleSingleModel(guardedBody, modelStr, target).catch((err) =>
+      const response = await handleSingleModel(guardedBody, modelStr, target).catch((err) =>
         errorResponse(502, err?.message ?? "Upstream model error")
       );
+      return maybeInvalidateEconomicEvidence(response, modelStr, target);
     }
 
     const timeoutController = new AbortController();
@@ -193,7 +202,7 @@ export function buildTargetTimeoutRunner(deps: {
       }
     }
     try {
-      return await Promise.race([
+      const response = await Promise.race([
         handleSingleModel(guardedBody, modelStr, targetWithSignal).catch((err) => {
           if (timedOut) {
             return new Response(null, { status: 599 });
@@ -206,6 +215,7 @@ export function buildTargetTimeoutRunner(deps: {
         log.error?.("COMBO", `Unexpected rejection in combo timeout race for ${modelStr}: ${detail}`);
         return errorResponse(502, `Combo timeout dispatch error: ${detail}`);
       });
+      return maybeInvalidateEconomicEvidence(response, modelStr, target);
     } finally {
       clearTimeout(timeoutId);
       if (parentHedgeSignal && onParentHedgeAbort) {

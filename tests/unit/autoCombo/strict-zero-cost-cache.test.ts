@@ -98,6 +98,58 @@ test("refresh rejection cannot preserve an old stale SAFE entry", async () => {
   assert.equal(cache.peek(KEY), undefined);
 });
 
+test("invalidation wins over an older refresh already in flight", async () => {
+  let releaseRefresh: ((evidence: ZeroSpendEvidence) => void) | undefined;
+  const cache = new ZeroSpendEvidenceCache({
+    ttlMs: 60_000,
+    now: () => START,
+    refresh: async () =>
+      await new Promise<ZeroSpendEvidence>((resolve) => {
+        releaseRefresh = resolve;
+      }),
+  });
+
+  assert.equal(cache.get(KEY), undefined);
+  assert.ok(releaseRefresh, "refresh must be in flight before invalidation");
+
+  cache.invalidate(KEY.provider, KEY.connectionId, KEY.model);
+  releaseRefresh!(safeEvidence(START));
+  await cache.whenIdle();
+
+  assert.equal(
+    cache.peek(KEY),
+    undefined,
+    "a response started before invalidation must never repopulate SAFE evidence afterwards"
+  );
+});
+
+test("account-wide invalidation also blocks all older model refreshes from repopulating", async () => {
+  const releases = new Map<string, (evidence: ZeroSpendEvidence) => void>();
+  const keys: ZeroSpendEvidenceKey[] = [
+    KEY,
+    { ...KEY, model: "model-y" },
+  ];
+  const cache = new ZeroSpendEvidenceCache({
+    ttlMs: 60_000,
+    now: () => START,
+    refresh: async (key) =>
+      await new Promise<ZeroSpendEvidence>((resolve) => {
+        releases.set(key.model, resolve);
+      }),
+  });
+
+  for (const key of keys) assert.equal(cache.get(key), undefined);
+  assert.equal(releases.size, 2);
+
+  cache.invalidate("fixture", "account-a");
+  for (const key of keys) releases.get(key.model)!(safeEvidence(START, { source: key.model }));
+  await cache.whenIdle();
+
+  for (const key of keys) {
+    assert.equal(cache.peek(key), undefined, `${key.model} must remain invalidated`);
+  }
+});
+
 test("evidence expires at its own expiresAt even when generic TTL is longer", async () => {
   let now = START;
   const cache = new ZeroSpendEvidenceCache({

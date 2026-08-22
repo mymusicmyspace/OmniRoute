@@ -189,6 +189,27 @@ test("effective zero price becomes SAFE only when independent account spend prot
   assert.equal(evidence?.source, "live-price+account-cap");
 });
 
+test("composed zero-price evidence is no fresher than its oldest independent proof", () => {
+  const oldPriceCheck = "2026-08-22T11:00:00.000Z";
+  const evidence = composeEffectiveZeroPriceEvidence(
+    {
+      inputPerMillion: 0,
+      outputPerMillion: 0,
+      checkedAt: oldPriceCheck,
+      expiresAt: null,
+      source: "old-live-price",
+      promotional: true,
+    },
+    {
+      paidSpendPossible: false,
+      hardStopVerified: true,
+      source: "fresh-safety",
+      checkedAt: NOW,
+    }
+  );
+  assert.equal(evidence?.checkedAt, oldPriceCheck);
+});
+
 test("zero-price model is not admitted when the account can silently fall through to paid spend", () => {
   const evidence = composeEffectiveZeroPriceEvidence(
     {

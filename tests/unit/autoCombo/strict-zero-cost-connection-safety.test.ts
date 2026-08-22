@@ -4,22 +4,29 @@ import assert from "node:assert/strict";
 import {
   evaluateCandidateConnections,
   filterStrictZeroCostCandidates,
-  type FreeAccessState,
   type StrictZeroCostCandidate,
 } from "../../../open-sse/services/autoCombo/strictZeroCostFilter.ts";
+import type { ZeroSpendEvidence } from "../../../open-sse/services/autoCombo/zeroSpendEvidence.ts";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "../../../open-sse/services/autoCombo/resilienceCandidateFilter.ts";
 import type { FreeModelBudget } from "../../../open-sse/config/freeModelCatalog.ts";
 
 const NOW = "2026-08-22T12:00:00.000Z";
-const OPTIONS = { minRemainingAllowance: 1, maxStateAgeMs: 180_000, now: () => Date.parse(NOW) };
+const OPTIONS = { minRemainingAllowance: 1, maxEvidenceAgeMs: 180_000, now: () => Date.parse(NOW) };
 const REAL_CONN = "real-connection-42";
 
-function safeState(overrides: Partial<FreeAccessState> = {}): FreeAccessState {
+function safeEvidence(overrides: Partial<ZeroSpendEvidence> = {}): ZeroSpendEvidence {
   return {
     status: "SAFE",
+    kind: "free-quota",
     remainingFreeAllowance: 40,
-    resetAt: null,
+    effectiveInputPrice: null,
+    effectiveOutputPrice: null,
+    paidSpendPossible: false,
+    hardStopVerified: true,
     checkedAt: NOW,
+    expiresAt: null,
+    source: "fixture",
+    promotional: false,
     ...overrides,
   };
 }
@@ -57,18 +64,22 @@ test("credentialed access never inherits the keyless shortcut", () => {
     model: "kp-model",
     connectionId: REAL_CONN,
   };
-  let called = false;
-  const out = evaluateCandidateConnections(
-    candidate,
-    keylessEntry(),
-    () => {
-      called = true;
-      return safeState();
-    },
-    OPTIONS
+  assert.deepEqual(
+    evaluateCandidateConnections(candidate, keylessEntry(), () => undefined, OPTIONS),
+    []
   );
-  assert.deepEqual(out, []);
-  assert.equal(called, false, "missing hard-stop metadata must fail before any quota lookup");
+});
+
+test("credentialed keyless-catalogued access may pass only with independent typed evidence", () => {
+  const candidate: StrictZeroCostCandidate = {
+    provider: "kp",
+    model: "kp-model",
+    connectionId: REAL_CONN,
+  };
+  assert.deepEqual(
+    evaluateCandidateConnections(candidate, keylessEntry(), () => safeEvidence(), OPTIONS),
+    [REAL_CONN]
+  );
 });
 
 test("non-keyless metadata on the synthetic no-auth path fails closed", () => {
@@ -78,7 +89,7 @@ test("non-keyless metadata on the synthetic no-auth path fails closed", () => {
     connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID,
   };
   assert.deepEqual(
-    evaluateCandidateConnections(candidate, quotaEntry(), () => safeState(), OPTIONS),
+    evaluateCandidateConnections(candidate, quotaEntry(), () => safeEvidence(), OPTIONS),
     []
   );
 });
@@ -92,8 +103,8 @@ test("multi-account candidate keeps exactly the verified SAFE subset", () => {
   };
   const result = filterStrictZeroCostCandidates([candidate], {
     enabled: true,
-    resolveFreeAccessState: (_provider, connectionId) =>
-      connectionId === "B" ? safeState() : undefined,
+    resolveZeroSpendEvidence: (_provider, connectionId) =>
+      connectionId === "B" ? safeEvidence() : undefined,
     catalog: [quotaEntry()],
     ...OPTIONS,
   });
@@ -115,8 +126,8 @@ test("EXHAUSTED account is removed while another SAFE account remains", () => {
     quotaEntry(),
     (_provider, connectionId) =>
       connectionId === "A"
-        ? safeState({ status: "EXHAUSTED", remainingFreeAllowance: 0 })
-        : safeState(),
+        ? safeEvidence({ status: "EXHAUSTED", remainingFreeAllowance: 0 })
+        : safeEvidence(),
     OPTIONS
   );
   assert.deepEqual(safe, ["B"]);
@@ -132,7 +143,7 @@ test("unchanged verified allowlist preserves array and candidate identity", () =
   const pool = [candidate];
   const result = filterStrictZeroCostCandidates(pool, {
     enabled: true,
-    resolveFreeAccessState: () => safeState(),
+    resolveZeroSpendEvidence: () => safeEvidence(),
     catalog: [quotaEntry()],
     ...OPTIONS,
   });
@@ -150,7 +161,7 @@ test("all UNKNOWN accounts drop the logical candidate entirely", () => {
   assert.deepEqual(
     filterStrictZeroCostCandidates([candidate], {
       enabled: true,
-      resolveFreeAccessState: () => undefined,
+      resolveZeroSpendEvidence: () => undefined,
       catalog: [quotaEntry()],
       ...OPTIONS,
     }),

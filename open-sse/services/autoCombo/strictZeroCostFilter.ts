@@ -8,8 +8,6 @@ import {
   type ZeroSpendEvidence,
 } from "./zeroSpendEvidence.ts";
 
-const KEYLESS_FREE_TYPES = new Set<FreeModelBudget["freeType"]>(["keyless"]);
-
 export interface StrictZeroCostCandidate {
   provider: string;
   model: string;
@@ -72,11 +70,12 @@ export function evaluateCandidateConnections(
   const isGenuineNoAuthCandidate =
     candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID;
 
-  // A synthetic no-auth route has no concrete account from which to obtain live
-  // economic evidence. It therefore needs curated keyless metadata. A free-looking
-  // model name alone is never enough.
+  // A genuine synthetic no-auth route has no user account that can be billed.
+  // Curated free-catalog membership is still required so a free-looking name cannot
+  // manufacture eligibility, but the catalog's quota shape may be keyless, daily,
+  // or uncapped depending on how that public service documents its limits.
   if (isGenuineNoAuthCandidate) {
-    if (budgetEntry && KEYLESS_FREE_TYPES.has(budgetEntry.freeType)) {
+    if (budgetEntry && budgetEntry.freeType !== "discontinued") {
       return [SYNTHETIC_NOAUTH_CONNECTION_ID];
     }
     return [];
